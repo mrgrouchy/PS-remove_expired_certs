@@ -4,7 +4,7 @@
 
 .REQUIREMENTS
   - Microsoft Graph PowerShell SDK (Install-Module Microsoft.Graph -Scope AllUsers)
-  - Directory read permission (Application.Read.All). You’ll be prompted to consent.
+  - Directory read permission (Application.Read.All)
 
 .EXAMPLES
   .\Get-ExpiredGraphAppCerts.ps1
@@ -19,9 +19,7 @@ param(
     [string] $LogPath = (Join-Path -Path $PSScriptRoot -ChildPath "Get-ExpiredGraphAppCerts.log")
 )
 
-# region Logging ---------------------------------------------------------------
-
-# Use user's Write-Log signature (relies on $logpath variable)
+# --- Logging (uses your signature) -------------------------------------------
 function Write-Log {
     param (
         [string]$Message,
@@ -32,33 +30,30 @@ function Write-Log {
     Add-Content -Path $logpath -Value $entry
 }
 
-# Prepare log path variable & folder
 $script:logpath = $LogPath
 try {
     $logDir = Split-Path -Path $script:logpath -Parent
     if ($logDir -and -not (Test-Path -Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        Write-Log -Message "Created log directory '$logDir'" -Level "SUCCESS"
     }
-    # Start banner
-    Write-Log -Message "----- Run started: $(Get-Date -Format o) -----"
-    Write-Log -Message "Parameters: IncludeServicePrincipals=$IncludeServicePrincipals; ExportCsv='$ExportCsv'; LogPath='$LogPath'"
+    Write-Log -Message "----- Run started: $(Get-Date -Format o) -----" -Level "INFO"
+    Write-Log -Message "Parameters: IncludeServicePrincipals=$IncludeServicePrincipals; ExportCsv='$ExportCsv'; LogPath='$LogPath'" -Level "INFO"
 }
 catch {
     Write-Warning "Failed to initialize logging: $($_.Exception.Message)"
 }
 
-# endregion Logging ------------------------------------------------------------
-
 function Connect-GraphIfNeeded {
     if (-not (Get-MgContext)) {
         $scopes = @('Application.Read.All')
-        Write-Log -Message "Connecting to Microsoft Graph with scopes: $($scopes -join ', ')"
+        Write-Log -Message "Connecting to Microsoft Graph with scopes: $($scopes -join ', ')" -Level "INFO"
         Connect-MgGraph -Scopes $scopes | Out-Null
         Select-MgProfile -Name "v1.0"
-        Write-Log -Message "Connected to Microsoft Graph; profile set to v1.0"
+        Write-Log -Message "Connected to Microsoft Graph; profile set to v1.0" -Level "SUCCESS"
     }
     else {
-        Write-Log -Message "Microsoft Graph context already present; reusing existing connection"
+        Write-Log -Message "Microsoft Graph context already present; reusing existing connection" -Level "INFO"
     }
 }
 
@@ -101,8 +96,8 @@ function Get-ExpiredFrom-KeyCredentials {
                 }
                 $expiredLocal += $obj
 
-                # Log each expired certificate as WARN
-                Write-Log -Message ("Expired {0} cert found: DisplayName='{1}', AppId='{2}', Thumbprint='{3}', EndDateUtc='{4:O}', KeyId='{5}'" -f `
+                # Per-cert finding
+                Write-Log -Message ("Expired {0} cert: DisplayName='{1}', AppId='{2}', Thumbprint='{3}', EndDateUtc='{4:O}', KeyId='{5}'" -f `
                         $EntityType, $item.DisplayName, ($obj.AppId ?? ''), $thumb, $end, $kc.KeyId) -Level "WARN"
             }
         }
@@ -113,51 +108,56 @@ function Get-ExpiredFrom-KeyCredentials {
 
 function Get-AllApplications {
     $props = 'id,displayName,appId,keyCredentials'
-    Write-Log -Message "Fetching Applications with properties: $props"
+    Write-Log -Message "Fetching Applications with properties: $props" -Level "INFO"
     $result = Get-MgApplication -All -Property $props
     $count = ($result | Measure-Object).Count
-    Write-Log -Message "Fetched $count application(s)"
+    Write-Log -Message "Fetched $count application(s)" -Level "SUCCESS"
     return $result
 }
 
 function Get-AllServicePrincipals {
     $props = 'id,displayName,appId,keyCredentials'
-    Write-Log -Message "Fetching Service Principals with properties: $props"
+    Write-Log -Message "Fetching Service Principals with properties: $props" -Level "INFO"
     $result = Get-MgServicePrincipal -All -Property $props
     $count = ($result | Measure-Object).Count
-    Write-Log -Message "Fetched $count service principal(s)"
+    Write-Log -Message "Fetched $count service principal(s)" -Level "SUCCESS"
     return $result
 }
 
-# --- main ---
+# --- main --------------------------------------------------------------------
 try {
-    Write-Log -Message "Starting expired certificate scan"
+    Write-Log -Message "Starting expired certificate scan" -Level "INFO"
     Connect-GraphIfNeeded
 
     $apps = Get-AllApplications
-    Write-Log -Message "Scanning Applications for expired certificates"
+    Write-Log -Message "Scanning Applications for expired certificates" -Level "INFO"
     $expired = Get-ExpiredFrom-KeyCredentials -Items $apps -EntityType 'Application'
 
     if ($IncludeServicePrincipals) {
         $sps = Get-AllServicePrincipals
-        Write-Log -Message "Scanning Service Principals for expired certificates"
+        Write-Log -Message "Scanning Service Principals for expired certificates" -Level "INFO"
         $expired += Get-ExpiredFrom-KeyCredentials -Items $sps -EntityType 'ServicePrincipal'
     }
 
-    # Sort newest-expired first for convenience
     $expired = $expired | Sort-Object EndDateUtc -Descending
-
     $expiredCount = ($expired | Measure-Object).Count
-    Write-Log -Message "Total expired certificates found: $expiredCount" -Level ($expiredCount -gt 0 ? "WARN" : "INFO")
+
+    if ($expiredCount -gt 0) {
+        Write-Log -Message "Total expired certificates found: $expiredCount" -Level "WARN"
+    }
+    else {
+        Write-Log -Message "No expired certificates found" -Level "SUCCESS"
+    }
 
     if ($ExportCsv) {
         try {
             $csvDir = Split-Path -Path $ExportCsv -Parent
             if ($csvDir -and -not (Test-Path -Path $csvDir)) {
                 New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
+                Write-Log -Message "Created CSV output directory '$csvDir'" -Level "SUCCESS"
             }
             $expired | Export-Csv -Path $ExportCsv -NoTypeInformation -Encoding UTF8
-            Write-Log -Message "Exported expired certificate list to '$ExportCsv'"
+            Write-Log -Message "Exported expired certificate list to '$ExportCsv'" -Level "SUCCESS"
             Write-Host "Exported expired certificate list to: $ExportCsv"
         }
         catch {
@@ -168,11 +168,10 @@ try {
 
     if (-not $expired) {
         Write-Host "No expired certificates were found." -ForegroundColor Green
-        Write-Log -Message "No expired certificates found"
     }
     else {
         $expired | Format-Table EntityType, DisplayName, AppId, Thumbprint, KeyDisplayName, EndDateUtc, StartDateUtc, KeyId -AutoSize
-        Write-Log -Message "Printed expired certificates to console"
+        Write-Log -Message "Printed expired certificates to console" -Level "INFO"
     }
 }
 catch {
@@ -180,5 +179,5 @@ catch {
     Write-Error $_
 }
 finally {
-    Write-Log -Message "----- Run finished: $(Get-Date -Format o) -----"
+    Write-Log -Message "----- Run finished: $(Get-Date -Format o) -----" -Level "INFO"
 }

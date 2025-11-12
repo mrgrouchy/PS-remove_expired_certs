@@ -83,6 +83,9 @@ function Get-ExpiredFrom-KeyCredentials {
             $end = [DateTime]$kc.EndDateTime
             if ($end -lt $now) {
                 $thumb = Convert-Thumbprint -Bytes $kc.CustomKeyIdentifier
+                $appIdStr = if ($EntityType -eq 'Application') { [string]$item.AppId } else { '' }
+                $expiredDays = [int][math]::Floor(($now - $end).TotalDays)
+
                 $obj = [pscustomobject]@{
                     EntityType     = $EntityType
                     DisplayName    = $item.DisplayName
@@ -96,9 +99,9 @@ function Get-ExpiredFrom-KeyCredentials {
                 }
                 $expiredLocal += $obj
 
-                # Per-cert finding
-                Write-Log -Message ("Expired {0} cert: DisplayName='{1}', AppId='{2}', Thumbprint='{3}', EndDateUtc='{4:O}', KeyId='{5}'" -f `
-                        $EntityType, $item.DisplayName, ($obj.AppId ?? ''), $thumb, $end, $kc.KeyId) -Level "WARN"
+                # Explicitly log the expiry date (UTC) and how long ago it expired
+                Write-Log -Message ("Expired {0} cert | DisplayName='{1}' | AppId='{2}' | Thumbprint='{3}' | ExpiryDateUtc='{4:O}' | ExpiredDays={5} | KeyId='{6}'" -f `
+                        $EntityType, $item.DisplayName, $appIdStr, $thumb, $end, $expiredDays, $kc.KeyId) -Level "WARN"
             }
         }
     }
@@ -143,7 +146,11 @@ try {
     $expiredCount = ($expired | Measure-Object).Count
 
     if ($expiredCount -gt 0) {
+        # Summarize oldest/newest expiry for convenience
+        $newestExpired = $expired | Select-Object -First 1
+        $oldestExpired = $expired | Select-Object -Last 1
         Write-Log -Message "Total expired certificates found: $expiredCount" -Level "WARN"
+        Write-Log -Message ("Newest expired cert date (UTC): {0:O} | Oldest expired cert date (UTC): {1:O}" -f $newestExpired.EndDateUtc, $oldestExpired.EndDateUtc) -Level "INFO"
     }
     else {
         Write-Log -Message "No expired certificates found" -Level "SUCCESS"

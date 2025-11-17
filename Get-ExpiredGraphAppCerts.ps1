@@ -9,14 +9,18 @@
 .EXAMPLES
   .\Get-ExpiredGraphAppCerts.ps1
   .\Get-ExpiredGraphAppCerts.ps1 -IncludeServicePrincipals
-  .\Get-ExpiredGraphAppCerts.ps1 -ExportCsv .\expired-certs.csv -LogPath .\logs\expired.log
+  .\Get-ExpiredGraphAppCerts.ps1 -ExportCsv .\expired-certs.csv
 #>
 
 [CmdletBinding()]
 param(
     [switch] $IncludeServicePrincipals,
-    [string] $ExportCsv,
-    [string] $LogPath = (Join-Path -Path $PSScriptRoot -ChildPath "Get-ExpiredGraphAppCerts.log")
+
+    # Default: per-run CSV file with date/time in the name
+    [string] $ExportCsv = (Join-Path -Path $PSScriptRoot -ChildPath ("expired-certs_{0:yyyyMMdd_HHmmss}.csv" -f (Get-Date))),
+
+    # Default: per-run log file with date/time in the name
+    [string] $LogPath = (Join-Path -Path $PSScriptRoot -ChildPath ("Get-ExpiredGraphAppCerts_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date)))
 )
 
 # --- Logging (uses your signature) -------------------------------------------
@@ -86,9 +90,11 @@ function Get-ExpiredFrom-KeyCredentials {
                 $appIdStr = if ($EntityType -eq 'Application') { [string]$item.AppId } else { '' }
                 $expiredDays = [int][math]::Floor(($now - $end).TotalDays)
 
+                # AppName added explicitly for CSV
                 $obj = [pscustomobject]@{
                     EntityType     = $EntityType
                     DisplayName    = $item.DisplayName
+                    AppName        = $item.DisplayName
                     ObjectId       = $item.Id
                     AppId          = if ($EntityType -eq 'Application') { $item.AppId } else { $null }
                     KeyDisplayName = $kc.DisplayName
@@ -156,28 +162,27 @@ try {
         Write-Log -Message "No expired certificates found" -Level "SUCCESS"
     }
 
-    if ($ExportCsv) {
-        try {
-            $csvDir = Split-Path -Path $ExportCsv -Parent
-            if ($csvDir -and -not (Test-Path -Path $csvDir)) {
-                New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
-                Write-Log -Message "Created CSV output directory '$csvDir'" -Level "SUCCESS"
-            }
-            $expired | Export-Csv -Path $ExportCsv -NoTypeInformation -Encoding UTF8
-            Write-Log -Message "Exported expired certificate list to '$ExportCsv'" -Level "SUCCESS"
-            Write-Host "Exported expired certificate list to: $ExportCsv"
+    # Always export CSV (with default timestamped path, or user override)
+    try {
+        $csvDir = Split-Path -Path $ExportCsv -Parent
+        if ($csvDir -and -not (Test-Path -Path $csvDir)) {
+            New-Item -ItemType Directory -Path $csvDir -Force | Out-Null
+            Write-Log -Message "Created CSV output directory '$csvDir'" -Level "SUCCESS"
         }
-        catch {
-            Write-Log -Message "Failed to export CSV: $($_.Exception.Message)" -Level "ERROR"
-            throw
-        }
+        $expired | Export-Csv -Path $ExportCsv -NoTypeInformation -Encoding UTF8
+        Write-Log -Message "Exported expired certificate list to '$ExportCsv'" -Level "SUCCESS"
+        Write-Host "Exported expired certificate list to: $ExportCsv"
+    }
+    catch {
+        Write-Log -Message "Failed to export CSV: $($_.Exception.Message)" -Level "ERROR"
+        throw
     }
 
     if (-not $expired) {
         Write-Host "No expired certificates were found." -ForegroundColor Green
     }
     else {
-        $expired | Format-Table EntityType, DisplayName, AppId, Thumbprint, KeyDisplayName, EndDateUtc, StartDateUtc, KeyId -AutoSize
+        $expired | Format-Table EntityType, DisplayName, AppName, AppId, Thumbprint, KeyDisplayName, EndDateUtc, StartDateUtc, KeyId -AutoSize
         Write-Log -Message "Printed expired certificates to console" -Level "INFO"
     }
 }

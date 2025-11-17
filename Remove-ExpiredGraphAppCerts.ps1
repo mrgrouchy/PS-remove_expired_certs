@@ -1,11 +1,12 @@
 <# 
 .SYNOPSIS
   Removes expired certificates from App Registrations / Service Principals based on a CSV list.
+  Reconfirms each cert is expired right before removal. Supports -DryRun. Logs with Write-Log.
 
 .DESCRIPTION
   - CSV must contain at least: EntityType (Application|ServicePrincipal), ObjectId, KeyId, EndDateUtc (optional for context).
   - For each row: fetch the latest object, confirm the key still exists AND is expired, then remove it.
-  - Dry run supported (no changes; logs intended actions).
+  - Supports DryRun mode (no changes, logs only).
 
 .REQUIREMENTS
   - Microsoft Graph PowerShell SDK (Install-Module Microsoft.Graph -Scope AllUsers)
@@ -26,7 +27,7 @@ param(
     [string] $LogPath = (Join-Path -Path $PSScriptRoot -ChildPath "Remove-ExpiredGraphCerts.log")
 )
 
-# --- Logging (uses your signature) -------------------------------------------
+# --- Logging (your signature) -------------------------------------------------
 function Write-Log {
     param (
         [string]$Message,
@@ -53,17 +54,34 @@ catch {
 
 # --- Graph connection ---------------------------------------------------------
 function Connect-GraphIfNeeded {
-    if (-not (Get-MgContext)) {
-        $scopes = @('Application.ReadWrite.All', 'Directory.ReadWrite.All')
-        Write-Log -Message "Connecting to Microsoft Graph with scopes: $($scopes -join ', ')" -Level "INFO"
-        Connect-MgGraph -Scopes $scopes | Out-Null
-        Select-MgProfile -Name "v1.0"
-        Write-Log -Message "Connected to Microsoft Graph; profile set to v1.0" -Level "SUCCESS"
+    $requiredScopes = @(
+        "Application.ReadWrite.All",
+        "Directory.ReadWrite.All"
+    )
+
+    $ctx = Get-MgContext
+    $missing = @()
+
+    if ($ctx -and $ctx.Scopes) {
+        $missing = $requiredScopes | Where-Object { $_ -notin $ctx.Scopes }
     }
     else {
-        Write-Log -Message "Microsoft Graph context already present; reusing existing connection" -Level "INFO"
+        $missing = $requiredScopes
+    }
+
+    if (-not $ctx -or $missing.Count -gt 0) {
+        # Drop any existing read-only session so we can re-auth with the right scopes
+        Disconnect-MgGraph -ErrorAction SilentlyContinue
+
+        Write-Log -Message ("Connecting to Microsoft Graph with scopes: {0}" -f ($requiredScopes -join ", ")) -Level "INFO"
+        Connect-MgGraph -Scopes $requiredScopes | Out-Null
+        
+    }
+    else {
+        Write-Log -Message "Microsoft Graph context already present with required scopes; reusing existing connection" -Level "INFO"
     }
 }
+
 
 # --- Helpers ------------------------------------------------------------------
 function Get-ObjectWithKeys {
@@ -80,63 +98,66 @@ function Get-ObjectWithKeys {
     }
 }
 
+# Update helper that:
+# - Computes remaining keys from the *live* object
+# - If none remain, PATCHes keyCredentials to []
+# - Otherwise, uses Update-Mg* with the remaining keys
 function Update-ObjectKeys {
     param(
         [Parameter(Mandatory)][ValidateSet('Application', 'ServicePrincipal')] [string] $EntityType,
         [Parameter(Mandatory)][string] $ObjectId,
-        [Parameter(Mandatory)][array] $KeyCredentials
+        [Parameter(Mandatory)][guid] $RemoveKeyId,
+        [Parameter(Mandatory)] $SourceObject,
+        [switch] $DryRun
     )
+
+    # Compute remaining keys from the live object
+    $remaining = @($SourceObject.KeyCredentials | Where-Object { $_.KeyId -ne $RemoveKeyId })
+    $remainingCount = ($remaining | Measure-Object).Count
+
+    if ($remainingCount -eq 0) {
+        if ($DryRun) {
+            Write-Log -Message ("DRYRUN: Would PATCH {0} '{1}' keyCredentials to [] (clear all certs)" -f $EntityType, $ObjectId) -Level "INFO"
+            return
+        }
+
+        $uri = if ($EntityType -eq 'Application') {
+            "https://graph.microsoft.com/v1.0/applications/$ObjectId"
+        }
+        else {
+            "https://graph.microsoft.com/v1.0/servicePrincipals/$ObjectId"
+        }
+
+        $body = @{ keyCredentials = @() } | ConvertTo-Json -Depth 5
+        Invoke-MgGraphRequest -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' -ErrorAction Stop | Out-Null
+        Write-Log -Message ("Patched {0} '{1}' keyCredentials to empty array" -f $EntityType, $ObjectId) -Level "SUCCESS"
+        return
+    }
+
+    # Non-empty path — use the SDK to keep types intact
+    if ($DryRun) {
+        Write-Log -Message ("DRYRUN: Would update {0} '{1}' with {2} remaining key(s)" -f $EntityType, $ObjectId, $remainingCount) -Level "INFO"
+        return
+    }
+
     if ($EntityType -eq 'Application') {
-        Update-MgApplication -ApplicationId $ObjectId -KeyCredentials $KeyCredentials -ErrorAction Stop | Out-Null
+        Update-MgApplication -ApplicationId $ObjectId -KeyCredentials $remaining -ErrorAction Stop | Out-Null
     }
     else {
-        Update-MgServicePrincipal -ServicePrincipalId $ObjectId -KeyCredentials $KeyCredentials -ErrorAction Stop | Out-Null
+        Update-MgServicePrincipal -ServicePrincipalId $ObjectId -KeyCredentials $remaining -ErrorAction Stop | Out-Null
     }
 }
 
 function TryParse-Guid {
     param([string]$Text)
-    try { [guid]$Text | Out-Null; return $true } catch { return $false }
-}
-
-# ===== FIXED: culture-safe date parsing for CSV EndDateUtc (optional) =====
-function TryParse-DateTimeFlexible {
-    param([string]$Text)
-
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-
-    # Ensure the enum type is preserved (Windows PowerShell is strict about this)
-    $styles = [System.Globalization.DateTimeStyles](
-        [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
-        [System.Globalization.DateTimeStyles]::AdjustToUniversal
-    )
-
-    $cultures = @(
-        [System.Globalization.CultureInfo]::InvariantCulture,
-        [System.Globalization.CultureInfo]::GetCultureInfo('en-GB'),
-        [System.Globalization.CultureInfo]::GetCultureInfo('en-US')
-    )
-    $formats = @(
-        'o', 's', 'u',                       # ISO/round-trip/sortable
-        'yyyy-MM-dd HH:mm:ss', 'yyyy-MM-dd',
-        'yyyy/MM/dd HH:mm:ss', 'yyyy/MM/dd',
-        'dd/MM/yyyy HH:mm:ss', 'dd/MM/yyyy',
-        'MM/dd/yyyy HH:mm:ss', 'MM/dd/yyyy'
-    )
-
-    foreach ($c in $cultures) {
-        foreach ($f in $formats) {
-            # Predeclare as [datetime] so [ref] binding matches the overload
-            [datetime]$dt = [datetime]::MinValue
-            if ([System.DateTime]::TryParseExact($Text, $f, $c, $styles, [ref]$dt)) { return $dt }
-        }
-        [datetime]$dt2 = [datetime]::MinValue
-        if ([System.DateTime]::TryParse($Text, $c, $styles, [ref]$dt2)) { return $dt2 }
+    try {
+        [guid]$Text | Out-Null
+        return $true
     }
-
-    return $null
+    catch {
+        return $false
+    }
 }
-# ==========================================================================
 
 # --- Main ---------------------------------------------------------------------
 try {
@@ -169,19 +190,16 @@ try {
         $objectId = [string]$row.ObjectId
         $keyIdText = [string]$row.KeyId
 
-        # CSV EndDateUtc is optional context; parse safely if present
-        $csvDateRaw = $null
-        $csvDateParsed = $null
+        # CSV EndDateUtc is optional context; log it as-is (no parsing needed)
+        $csvDateForLog = $null
         if ($row.PSObject.Properties.Name -contains 'EndDateUtc') {
-            $csvDateRaw = [string]$row.EndDateUtc
-            $csvDateParsed = TryParse-DateTimeFlexible $csvDateRaw
-            if ($csvDateRaw -and -not $csvDateParsed) {
-                Write-Log -Message ("CSV EndDateUtc '{0}' could not be parsed; continuing (live expiry will be used)" -f $csvDateRaw) -Level "WARN"
-            }
+            $csvDateForLog = [string]$row.EndDateUtc
         }
 
         # Validate basic fields
-        if ([string]::IsNullOrWhiteSpace($entityType) -or [string]::IsNullOrWhiteSpace($objectId) -or [string]::IsNullOrWhiteSpace($keyIdText)) {
+        if ([string]::IsNullOrWhiteSpace($entityType) -or
+            [string]::IsNullOrWhiteSpace($objectId) -or
+            [string]::IsNullOrWhiteSpace($keyIdText)) {
             Write-Log -Message "Row missing required fields (EntityType/ObjectId/KeyId). Row: $($row | ConvertTo-Json -Compress)" -Level "ERROR"
             $errors++
             continue
@@ -221,26 +239,23 @@ try {
             $endLive = [datetime]$key.EndDateTime
             if ($endLive -ge $now) {
                 Write-Log -Message ("KeyId '{0}' on {1} '{2}' is NOT expired (LiveExpiryUtc='{3:O}'; CsvEndDate='{4}') — skipping" -f `
-                        $keyId, $entityType, $objectId, $endLive, ($csvDateParsed ? $csvDateParsed.ToString("o") : $csvDateRaw)) -Level "WARN"
+                        $keyId, $entityType, $objectId, $endLive, $csvDateForLog) -Level "WARN"
                 $skippedNotExpired++
                 continue
             }
 
-            # Build the new key list (remove target)
-            $newKeys = @($obj.KeyCredentials | Where-Object { $_.KeyId -ne $keyId })
+            # Apply update (helper will compute remaining keys and handle empty case)
+            Update-ObjectKeys -EntityType $entityType -ObjectId $objectId -RemoveKeyId $keyId -SourceObject $obj -DryRun:$DryRun
 
-            # Dry run?
-            if ($DryRun) {
-                Write-Log -Message ("DRYRUN: Would remove KeyId '{0}' from {1} '{2}' (DisplayName='{3}', AppId='{4}') | LiveExpiryUtc='{5:O}' | CsvEndDate='{6}'" -f `
-                        $keyId, $entityType, $objectId, $obj.DisplayName, ($obj.AppId -as [string]), $endLive, ($csvDateParsed ? $csvDateParsed.ToString("o") : $csvDateRaw)) -Level "INFO"
-                continue
+            if (-not $DryRun) {
+                $removedCount++
+                Write-Log -Message ("Removed KeyId '{0}' from {1} '{2}' (DisplayName='{3}', AppId='{4}') | LiveExpiryUtc='{5:O}' | CsvEndDate='{6}'" -f `
+                        $keyId, $entityType, $objectId, $obj.DisplayName, ($obj.AppId -as [string]), $endLive, $csvDateForLog) -Level "SUCCESS"
             }
-
-            # Perform update
-            Update-ObjectKeys -EntityType $entityType -ObjectId $objectId -KeyCredentials $newKeys
-
-            Write-Log -Message ("Removed KeyId '{0}' from {1} '{2}' (DisplayName='{3}', AppId='{4}') | LiveExpiryUtc='{5:O}' | CsvEndDate='{6}'" -f `
-                    $keyId, $entityType, $objectId, $obj.DisplayName, ($obj.AppId -as [string]), $endLive, ($csvDateParsed ? $csvDateParsed.ToString("o") : $csvDateRaw)) -Level "SUCCESS"
+            else {
+                Write-Log -Message ("DRYRUN: Would remove KeyId '{0}' from {1} '{2}' (DisplayName='{3}', AppId='{4}') | LiveExpiryUtc='{5:O}' | CsvEndDate='{6}'" -f `
+                        $keyId, $entityType, $objectId, $obj.DisplayName, ($obj.AppId -as [string]), $endLive, $csvDateForLog) -Level "INFO"
+            }
         }
         catch {
             $errors++
@@ -249,12 +264,13 @@ try {
     }
 
     if ($DryRun) {
-        Write-Log -Message ("DRYRUN complete. To apply removals, rerun without -DryRun. Summary: Rows={0}, NotFound={1}, NotExpired={2}, Errors={3}" -f `
-                $rowCount, $skippedNotFound, $skippedNotExpired, $errors) -Level "INFO"
+        Write-Log -Message ("DRYRUN complete. Summary: Rows={0}, WouldRemove={1}, NotFound={2}, NotExpired={3}, Errors={4}" -f `
+                $rowCount, $removedCount, $skippedNotFound, $skippedNotExpired, $errors) -Level "INFO"
     }
     else {
         $summaryLevel = "SUCCESS"
         if ($errors -gt 0) { $summaryLevel = "WARN" }
+
         Write-Log -Message ("Completed removals. Summary: Rows={0}, Removed={1}, NotFound={2}, NotExpired={3}, Errors={4}" -f `
                 $rowCount, $removedCount, $skippedNotFound, $skippedNotExpired, $errors) -Level $summaryLevel
     }

@@ -10,11 +10,11 @@
 
 .REQUIREMENTS
   - Microsoft Graph PowerShell SDK (Install-Module Microsoft.Graph -Scope AllUsers)
-  - Permissions: Application.ReadWrite.All and Directory.ReadWrite.All (delegated)
+  - Permissions: Application.ReadWrite.All and Directory.ReadWrite.All (delegated, admin consented)
 
 .EXAMPLES
   .\Remove-ExpiredGraphAppCerts.ps1 -CsvPath .\expired.csv -DryRun
-  .\Remove-ExpiredGraphAppCerts.ps1 -CsvPath .\expired.csv -LogPath .\logs\remove-expired.log
+  .\Remove-ExpiredGraphAppCerts.ps1 -CsvPath .\expired.csv
 #>
 
 [CmdletBinding()]
@@ -24,7 +24,8 @@ param(
 
     [switch] $DryRun,
 
-    [string] $LogPath = (Join-Path -Path $PSScriptRoot -ChildPath "Remove-ExpiredGraphCerts.log")
+    # Default: per-run log file with date/time in the name
+    [string] $LogPath = (Join-Path -Path $PSScriptRoot -ChildPath ("Remove-ExpiredGraphCerts_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date)))
 )
 
 # --- Logging (your signature) -------------------------------------------------
@@ -52,36 +53,38 @@ catch {
     Write-Warning "Failed to initialize logging: $($_.Exception.Message)"
 }
 
-# --- Graph connection ---------------------------------------------------------
+# --- Graph connection (ensure write scopes) ----------------------------------
 function Connect-GraphIfNeeded {
     $requiredScopes = @(
         "Application.ReadWrite.All",
         "Directory.ReadWrite.All"
     )
 
-    $ctx = Get-MgContext
-    $missing = @()
+    $ctx = $null
+    try { $ctx = Get-MgContext } catch {}
 
+    $missing = @()
     if ($ctx -and $ctx.Scopes) {
-        $missing = $requiredScopes | Where-Object { $_ -notin $ctx.Scopes }
+        foreach ($s in $requiredScopes) {
+            if ($s -notin $ctx.Scopes) { $missing += $s }
+        }
     }
     else {
         $missing = $requiredScopes
     }
 
     if (-not $ctx -or $missing.Count -gt 0) {
-        # Drop any existing read-only session so we can re-auth with the right scopes
         Disconnect-MgGraph -ErrorAction SilentlyContinue
 
         Write-Log -Message ("Connecting to Microsoft Graph with scopes: {0}" -f ($requiredScopes -join ", ")) -Level "INFO"
         Connect-MgGraph -Scopes $requiredScopes | Out-Null
-        
+        Select-MgProfile -Name "v1.0"
+        Write-Log -Message "Connected to Microsoft Graph; profile set to v1.0" -Level "SUCCESS"
     }
     else {
         Write-Log -Message "Microsoft Graph context already present with required scopes; reusing existing connection" -Level "INFO"
     }
 }
-
 
 # --- Helpers ------------------------------------------------------------------
 function Get-ObjectWithKeys {
@@ -117,7 +120,8 @@ function Update-ObjectKeys {
 
     if ($remainingCount -eq 0) {
         if ($DryRun) {
-            Write-Log -Message ("DRYRUN: Would PATCH {0} '{1}' keyCredentials to [] (clear all certs)" -f $EntityType, $ObjectId) -Level "INFO"
+            Write-Log -Message ("DRYRUN: Would PATCH {0} (ObjectId='{1}') keyCredentials to [] (clear all certs)" -f `
+                    $SourceObject.DisplayName, $ObjectId) -Level "INFO"
             return
         }
 
@@ -130,13 +134,15 @@ function Update-ObjectKeys {
 
         $body = @{ keyCredentials = @() } | ConvertTo-Json -Depth 5
         Invoke-MgGraphRequest -Method PATCH -Uri $uri -Body $body -ContentType 'application/json' -ErrorAction Stop | Out-Null
-        Write-Log -Message ("Patched {0} '{1}' keyCredentials to empty array" -f $EntityType, $ObjectId) -Level "SUCCESS"
+        Write-Log -Message ("Patched '{0}' (ObjectId='{1}') keyCredentials to empty array" -f `
+                $SourceObject.DisplayName, $ObjectId) -Level "INFO"
         return
     }
 
     # Non-empty path — use the SDK to keep types intact
     if ($DryRun) {
-        Write-Log -Message ("DRYRUN: Would update {0} '{1}' with {2} remaining key(s)" -f $EntityType, $ObjectId, $remainingCount) -Level "INFO"
+        Write-Log -Message ("DRYRUN: Would update '{0}' (ObjectId='{1}') with {2} remaining key(s)" -f `
+                $SourceObject.DisplayName, $ObjectId, $remainingCount) -Level "INFO"
         return
     }
 
@@ -190,7 +196,7 @@ try {
         $objectId = [string]$row.ObjectId
         $keyIdText = [string]$row.KeyId
 
-        # CSV EndDateUtc is optional context; log it as-is (no parsing needed)
+        # CSV EndDateUtc is optional context; log it as-is
         $csvDateForLog = $null
         if ($row.PSObject.Properties.Name -contains 'EndDateUtc') {
             $csvDateForLog = [string]$row.EndDateUtc
@@ -218,19 +224,26 @@ try {
         }
         $keyId = [guid]$keyIdText
 
+        $appName = $null
+        $appId = $null
+
         try {
             # Get the latest object + keys
             $obj = Get-ObjectWithKeys -EntityType $entityType -ObjectId $objectId
             if (-not $obj) {
-                Write-Log -Message "$entityType '$objectId' not found" -Level "ERROR"
+                Write-Log -Message "$entityType with ObjectId '$objectId' not found" -Level "ERROR"
                 $errors++
                 continue
             }
 
+            $appName = $obj.DisplayName
+            $appId = $obj.AppId
+
             # Find the key by KeyId
             $key = $obj.KeyCredentials | Where-Object { $_.KeyId -eq $keyId }
             if (-not $key) {
-                Write-Log -Message ("KeyId '{0}' not present on {1} '{2}' (DisplayName='{3}')" -f $keyId, $entityType, $objectId, $obj.DisplayName) -Level "WARN"
+                Write-Log -Message ("KeyId '{0}' not present on {1} (Name='{2}', ObjectId='{3}')" -f `
+                        $keyId, $entityType, $appName, $objectId) -Level "WARN"
                 $skippedNotFound++
                 continue
             }
@@ -238,8 +251,8 @@ try {
             # Re-check expiry against live data (authoritative)
             $endLive = [datetime]$key.EndDateTime
             if ($endLive -ge $now) {
-                Write-Log -Message ("KeyId '{0}' on {1} '{2}' is NOT expired (LiveExpiryUtc='{3:O}'; CsvEndDate='{4}') — skipping" -f `
-                        $keyId, $entityType, $objectId, $endLive, $csvDateForLog) -Level "WARN"
+                Write-Log -Message ("KeyId '{0}' on {1} (Name='{2}', ObjectId='{3}') is NOT expired (LiveExpiryUtc='{4:O}', CsvEndDate='{5}') — skipping" -f `
+                        $keyId, $entityType, $appName, $objectId, $endLive, $csvDateForLog) -Level "WARN"
                 $skippedNotExpired++
                 continue
             }
@@ -249,17 +262,24 @@ try {
 
             if (-not $DryRun) {
                 $removedCount++
-                Write-Log -Message ("Removed KeyId '{0}' from {1} '{2}' (DisplayName='{3}', AppId='{4}') | LiveExpiryUtc='{5:O}' | CsvEndDate='{6}'" -f `
-                        $keyId, $entityType, $objectId, $obj.DisplayName, ($obj.AppId -as [string]), $endLive, $csvDateForLog) -Level "SUCCESS"
+                Write-Log -Message ("Removed KeyId '{0}' from {1} (Name='{2}', ObjectId='{3}', AppId='{4}') | LiveExpiryUtc='{5:O}' | CsvEndDate='{6}'" -f `
+                        $keyId, $entityType, $appName, $objectId, ($appId -as [string]), $endLive, $csvDateForLog) -Level "SUCCESS"
             }
             else {
-                Write-Log -Message ("DRYRUN: Would remove KeyId '{0}' from {1} '{2}' (DisplayName='{3}', AppId='{4}') | LiveExpiryUtc='{5:O}' | CsvEndDate='{6}'" -f `
-                        $keyId, $entityType, $objectId, $obj.DisplayName, ($obj.AppId -as [string]), $endLive, $csvDateForLog) -Level "INFO"
+                Write-Log -Message ("DRYRUN: Would remove KeyId '{0}' from {1} (Name='{2}', ObjectId='{3}', AppId='{4}') | LiveExpiryUtc='{5:O}' | CsvEndDate='{6}'" -f `
+                        $keyId, $entityType, $appName, $objectId, ($appId -as [string]), $endLive, $csvDateForLog) -Level "INFO"
             }
         }
         catch {
             $errors++
-            Write-Log -Message ("Failed processing ObjectId '{0}' / KeyId '{1}': {2}" -f $objectId, $keyIdText, $_.Exception.Message) -Level "ERROR"
+            if ($appName) {
+                Write-Log -Message ("Failed processing '{0}' (ObjectId='{1}') / KeyId '{2}': {3}" -f `
+                        $appName, $objectId, $keyIdText, $_.Exception.Message) -Level "ERROR"
+            }
+            else {
+                Write-Log -Message ("Failed processing ObjectId '{0}' / KeyId '{1}': {2}" -f `
+                        $objectId, $keyIdText, $_.Exception.Message) -Level "ERROR"
+            }
         }
     }
 

@@ -1,3 +1,0 @@
-"EntityType","DisplayName","ObjectId","AppId","KeyDisplayName","KeyId","Thumbprint","StartDateUtc","EndDateUtc"
-"Application","test expired cert 1","0fed93de-8fb0-4552-9626-c1bf7738a172","2cdb90e2-0140-4cd9-a3cc-1d91dc628bac","CN=expired.test.local","f939ae68-3581-47b7-a5b8-bf421dbd4590","D3B0BDDB6E78EC1143037EC10C2D850C0E3DEC1D45D82D01E41DBADB9D41","17/11/2023 15:14:24","16/11/2025 15:14:24"
-"Application","expired cert 2","ae96889f-bf23-4eff-a81f-f1dc8d20de8d","3748edfd-d0bb-4d50-8b48-9c937295086d","CN=expired2.test.local","3535447e-5b8d-4772-960a-0fb1b07b3982","045DB8076E7B082EF5003F7DEF9E39EC207BE7CF030040F5E7AF79DF4D37","17/11/2023 15:19:33","28/10/2025 15:19:33"

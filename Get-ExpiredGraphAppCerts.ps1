@@ -49,7 +49,7 @@ function Connect-GraphIfNeeded {
         $scopes = @('Application.Read.All')
         Write-Log -Message "Connecting to Microsoft Graph with scopes: $($scopes -join ', ')" -Level "INFO"
         Connect-MgGraph -Scopes $scopes | Out-Null
-        Select-MgProfile -Name "v1.0"
+        #Select-MgProfile -Name "v1.0"
         Write-Log -Message "Connected to Microsoft Graph; profile set to v1.0" -Level "SUCCESS"
     }
     else {
